@@ -69,4 +69,3 @@ A comparação foca no modelo **Engram-27B** (26.7B params) contra um baseline *
 
 O módulo Engram representa um passo evolucionário na arquitetura de LLMs, validando a "memória condicional" como um bloco de construção fundamental. Ao aliviar o backbone da reconstrução de padrões estáticos e dependências locais, o modelo alcança um "ganho livre" em profundidade efetiva e capacidade de contexto global. Para futuros modelos de fronteira, ignorar este eixo de esparsidade pode significar desperdiçar capacidade computacional em operações triviais que poderiam ser resolvidas por um simples, porém massivo, *lookup table*.
 
-</FINAL_ANSWER>
