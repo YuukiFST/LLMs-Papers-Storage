@@ -1,5 +1,3 @@
-# LLMs-Documentation
-
 Reference: https://arxiv.org/pdf/2512.24601
 
 # Recursive Language Models: Quebrando as Barreiras de Contexto via Escalonamento em Tempo de Inferência
