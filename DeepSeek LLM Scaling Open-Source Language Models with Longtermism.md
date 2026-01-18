@@ -2,283 +2,193 @@
 
 ## Executive Summary
 
-DeepSeek LLM represents a significant contribution to open-source language model research, introducing a family of models (7B and 67B parameters) trained on 2 trillion tokens of bilingual (Chinese/English) data. The paper's core innovation lies in its rigorous re-examination of scaling laws, challenging previous work by Kaplan et al. (2020) and Hoffmann et al. (2022) while introducing methodological improvements that yield more accurate performance predictions.
-
-**Key Achievement**: DeepSeek LLM 67B surpasses LLaMA-2 70B across multiple benchmarks, particularly excelling in code (HumanEval: 42.7% vs 28.7%), mathematics (MATH: 18.7% vs 13.5%), and reasoning tasks (BBH: 68.7% vs 62.9%). The chat variant outperforms GPT-3.5 in both Chinese and English open-ended evaluations.
-
-**Research Impact**: The paper provides actionable insights for scaling future models through empirically-validated hyperparameter selection formulae and optimal compute allocation strategies, representing a "longtermist" approach to open-source LLM development.
+DeepSeek LLM represents a systematic investigation into scaling laws for large language models, introducing a 7B and 67B parameter model family trained on 2 trillion tokens. The research establishes novel scaling law formulations using non-embedding FLOPs/token as the model scale representation, replacing conventional parameter counts. Core findings demonstrate that optimal model/data allocation strategy exhibits data quality dependence: higher quality data necessitates increased compute allocation toward model scaling rather than data scaling. The 67B model surpasses LLaMA-2 70B across multiple benchmarks, achieving 18.7% on MATH (vs. 13.5%), 63.4% on GSM8K (vs. 58.4%), and 42.7% on HumanEval (vs. 28.7%). Post-alignment, DeepSeek 67B Chat achieves performance comparable to GPT-3.5 on open-ended evaluations while maintaining superior safety scores (97.8 on Do-Not-Answer benchmark).
 
 ---
 
-## Technical Analysis
+## 1. Technical Architecture
 
-### 1. Scaling Laws: A Paradigm Refinement
+### 1.1 Motivation and Problem Statement
 
-#### 1.1 Hyperparameter Scaling Laws
+Previous scaling law research presented inconsistent conclusions regarding optimal model/data allocation strategies when increasing compute budgets. The discrepancies between Kaplan et al. (2020) and Hoffmann et al. (2022) created uncertainty about generalizable scaling principles. Additionally, existing works inadequately addressed hyperparameter selection across different compute budgets, leaving open questions about whether models achieved optimal performance. The project addresses these uncertainties while developing open-source models in 7B and 67B configurations for the Chinese and English language domains.
 
-**Problem Statement**: Previous scaling law research inadequately addressed hyperparameter optimization across different compute budgets, creating uncertainty about whether models achieved optimal performance.
+### 1.2 Architecture Components
 
-**Methodology**: The team conducted extensive grid searches across compute budgets ranging from 1e17 to 2e19 FLOPs, evaluating batch size and learning rate combinations. They identified a "wide band" of near-optimal parameters (within 0.25% of minimum generalization error).
+DeepSeek LLM adopts the LLaMA architecture foundation with specific modifications. The architecture employs Pre-Norm structure with RMSNorm normalization, SwiGLU activation functions in Feed-Forward Networks with intermediate dimension of (8/3)d_model, and Rotary Position Embeddings (RoPE) for positional encoding.
 
-**Key Findings**:
+Model specifications diverge from standard configurations in layer allocation. DeepSeek 7B implements 30 layers with 4096 model dimension, 32 attention heads, and 32 key-value heads. DeepSeek 67B implements 95 layers with 8192 model dimension, 64 attention heads, and 8 key-value heads using Grouped-Query Attention (GQA). The 67B model expands parameters through network depth rather than FFN width to optimize performance.
 
-The optimal batch size and learning rate follow power law relationships with compute budget C:
+Vocabulary configuration uses Byte-level Byte-Pair Encoding (BBPE) with 100,000 conventional tokens plus 15 special tokens, extended to 102,400 for computational efficiency and future extensibility. The tokenizer prevents merging across character categories (newlines, punctuation, CJK symbols) and splits numbers into individual digits.
 
-```
-η_opt = 0.3118 · C^(-0.1250)
-B_opt = 0.2920 · C^(0.3271)
-```
-
-**Interpretation**: As compute budget increases:
-- Batch size gradually increases (exponent 0.3271)
-- Learning rate gradually decreases (exponent -0.1250)
-
-This aligns with intuitive empirical practices but provides the first quantitative formulation for the LLaMA-style architecture family.
-
-**Limitation Acknowledged**: The formulae don't account for factors beyond compute budget C. The authors note that models with identical compute but different model/data allocations exhibit slightly different optimal parameter spaces, suggesting more complex underlying dynamics.
-
-#### 1.2 Model Scale Representation Innovation
-
-**Critical Insight**: Previous work used either non-embedding parameters N₁ or complete parameters N₂ to represent model scale, both yielding significant approximation errors.
-
-**Novel Approach**: Introduction of **non-embedding FLOPs/token (M)** as the model scale representation:
+Mathematical formulation for non-embedding FLOPs/token:
 
 ```
-M = 72·n_layer·d_model² + 12·n_layer·d_model·l_seq
+M = 72 * n_layers * d_model^2 + 12 * n_layers * d_model * l_seq
 ```
 
-Compared to:
-```
-6N₁ = 72·n_layer·d_model²  (ignores attention overhead)
-6N₂ = 72·n_layer·d_model² + 6·n_vocab·d_model  (includes vocabulary)
-```
+where n_layers is layer count, d_model is model width, and l_seq is sequence length (4096). This metric accounts for attention computational overhead while excluding vocabulary computation.
 
-**Quantitative Impact**: Table 3 demonstrates that for small models (8 layers, 512 width), 6N₁ underestimates compute by 57% while 6N₂ overestimates by 32%. For large models (80 layers, 8192 width), discrepancies reduce to 8% and 6% respectively.
+### 1.3 Training or Pre-Training Protocol
 
-**Result**: Using M enables more accurate compute budget formulation (C = M·D instead of C ≈ 6N·D) and better performance predictions, as evidenced by Figure 5 showing accurate forecasting of 67B model performance from small-scale experiments.
+Pre-training utilizes 2 trillion tokens from multilingual sources with emphasis on Chinese and English. Data pipeline implements three-stage processing: deduplication, filtering, and remixing. Aggressive deduplication across 91 Common Crawl dumps achieves 89.8% deduplication rate compared to 22.2% for single-dump methods.
 
-#### 1.3 Optimal Model/Data Scaling Strategy
+Initialization employs standard deviation 0.006. Optimization uses AdamW with β1=0.9, β2=0.95, weight_decay=0.1, and gradient clipping at 1.0. Training precision is bf16 for forward/backward passes with fp32 gradient accumulation.
 
-Using IsoFLOP profiling across 8 compute budgets (1e17 to 3e20 FLOPs), the team fitted:
+Multi-step learning rate scheduler replaces cosine scheduling. Learning rate reaches maximum after 2000 warmup steps, decreases to 31.6% of maximum after 80% of tokens, and further reduces to 10% after 90% of tokens. This design facilitates continual training through phase reuse while maintaining performance equivalence with cosine scheduling.
 
-```
-M_opt = 0.1715 · C^0.5243
-D_opt = 5.8316 · C^0.4757
-```
+Model-specific hyperparameters derived from scaling laws:
+- 7B: batch size 2304, learning rate 4.2e-4, 2.0T tokens
+- 67B: batch size 4608, learning rate 3.2e-4, 2.0T tokens
 
-**Comparison with Prior Work**:
+Checkpoint saving occurs asynchronously every 5 minutes, limiting maximum training loss to 5 minutes in failure scenarios.
 
-| Study | Model Scaling Exponent (a) | Data Scaling Exponent (b) | Dataset |
-|-------|---------------------------|--------------------------|---------|
-| Kaplan et al. (OpenAI) | 0.73 | 0.27 | OpenWebText2 |
-| Hoffmann et al. (Chinchilla) | 0.49 | 0.51 | MassiveText |
-| DeepSeek (Early Data) | 0.450 | 0.550 | Internal v1 |
-| **DeepSeek (Current Data)** | **0.524** | **0.476** | Internal v2 |
-| DeepSeek (OpenWebText2) | 0.578 | 0.422 | OpenWebText2 |
+### 1.4 Performance Impact
 
-**Data Quality Hypothesis**: The exponent a increases with data quality, suggesting that higher-quality data supports larger models for the same data scale. This potentially explains divergent conclusions in prior scaling law research and provides an indirect data quality assessment method.
+Infrastructure employs HAI-LLM framework integrating data parallelism, tensor parallelism, sequence parallelism, and 1F1B pipeline parallelism with ZeRO-1 optimizer state partitioning. Flash attention optimizes hardware utilization. Computation-communication overlap minimizes waiting overhead including backward pass/reduce-scatter overlap and GEMM/all-gather/reduce-scatter overlap.
+
+Performance scaling predictions demonstrate accuracy across 1000× compute budget range. Validation set bits-per-byte for 7B and 67B models align precisely with extrapolated scaling curves from smaller-scale experiments (1e17 to 3e20 FLOPs).
+
+Efficiency optimizations include layer/operator fusion (LayerNorm, GEMM, Adam updates) and in-place cross-entropy computation converting bf16 logits to fp32 in CUDA kernel execution rather than pre-conversion in HBM, reducing memory consumption.
 
 ---
 
-### 2. Model Architecture and Training
+## 2. Post-Training or Optimization Methods
 
-#### 2.1 Architecture Design Decisions
+Alignment pipeline implements two-stage methodology: Supervised Fine-Tuning (SFT) followed by Direct Preference Optimization (DPO).
 
-**Base Architecture**: Follows LLaMA's proven design with modifications:
-- Pre-Norm structure with RMSNorm
-- SwiGLU activation (FFN intermediate dimension: 8/3·d_model)
-- Rotary Position Embedding (RoPE)
-- Grouped-Query Attention (GQA) for 67B model (8 KV heads for efficiency)
+SFT utilizes 1.5 million instruction instances: 1.2 million helpful data (31.2% general language, 46.6% mathematics, 22.2% coding) and 300K safety data across sensitive topics. Training duration is 4 epochs for 7B model and 2 epochs for 67B model to mitigate overfitting. Learning rates are 1e-5 (7B) and 5e-6 (67B).
 
-**Depth vs Width Trade-off**: 
-- DeepSeek 7B: 30 layers (vs typical ~32)
-- DeepSeek 67B: **95 layers** (vs LLaMA-2 70B's 80 layers)
+Two-stage fine-tuning addresses repetition issues in smaller models. Stage 1 uses all data; Stage 2 excludes math/code data to reduce repetition ratio from 2.0% to 1.4% in 7B model while maintaining benchmark performance. The 67B model exhibits sub-1% repetition after single-stage SFT.
 
-**Rationale**: Prioritizing depth over FFN width while maintaining parameter count yields better performance and facilitates pipeline partitioning for distributed training.
+DPO constructs preference data for helpfulness and harmlessness dimensions. Training executes one epoch with learning rate 5e-6, batch size 512, warmup and cosine scheduling. DPO enhances open-ended generation capabilities with minimal impact on standard benchmark performance.
 
-#### 2.2 Multi-Step Learning Rate Scheduler
-
-**Innovation**: Replaces cosine decay with a three-stage multi-step scheduler:
-1. 80% of tokens: Maximum learning rate
-2. 10% of tokens: 31.6% of maximum
-3. 10% of tokens: 10% of maximum
-
-**Advantages**:
-- Performance parity with cosine scheduler (Figure 1a)
-- **Enables continual training** by reusing early checkpoints
-- Flexibility for dynamic scaling decisions
-
-**Design Choice**: The 80/10/10 split balances reuse ratios against potential performance gains from alternative distributions (Figure 1b).
-
-#### 2.3 Data Pipeline
-
-**Scale**: 2 trillion tokens (bilingual Chinese/English corpus)
-
-**Processing Stages**:
-
-1. **Aggressive Deduplication**: Cross-dump deduplication of Common Crawl
-   - Single dump: 22.2% deduplication rate
-   - 91 dumps: **89.8% deduplication rate** (4× more effective)
-
-2. **Filtering**: Multi-level quality assessment
-   - Linguistic evaluation (individual document level)
-   - Semantic evaluation (corpus-level coherence)
-
-3. **Remixing**: Rebalancing underrepresented domains
-
-**Tokenizer**: BBPE (Byte-level BPE) with 100,000 conventional tokens + 15 special tokens, padded to 102,400 for computational efficiency. Number splitting follows LLaMA to improve numerical reasoning.
+Key findings: Math and code performance improvements (HumanEval +22 points, GSM8K +20+ points for 7B) attributed to base model underfitting on these domains. SFT learns reasoning format rather than reasoning capability itself. Performance degradation observed on cloze/completion tasks (HellaSwag) where language modeling objectives better align with evaluation format.
 
 ---
 
-### 3. Alignment Pipeline
+## 3. Agentic or System-Level Design (if applicable)
 
-#### 3.1 Supervised Fine-Tuning (SFT)
-
-**Data Composition**:
-- 1.5M instruction instances (1.2M helpful + 300K safety)
-- Helpful data distribution: 31.2% language tasks, 46.6% math, 22.2% code
-- Coverage: English and Chinese
-
-**Training Strategy**:
-- 7B model: 4 epochs with two-stage approach
-  - Stage 1: All data (48.2% HumanEval, 63.9% GSM8K, but 2.0% repetition)
-  - Stage 2: Conversational data only (maintains scores, reduces repetition to 1.4%)
-- 67B model: 2 epochs only (early overfitting observed, <1% repetition achieved in single stage)
-
-**Observation on Repetition**: Math SFT data's reasoning patterns cause weaker models to generate repetitive responses. Staged fine-tuning or DPO mitigates this without sacrificing benchmark performance.
-
-#### 3.2 Direct Preference Optimization (DPO)
-
-**Implementation**:
-- Learning rate: 5e-6
-- Batch size: 512
-- 1 epoch with warmup and cosine decay
-
-**Effect**: DPO enhances open-ended generation quality (MT-Bench: 8.35 → 8.76) with minimal impact on standard benchmarks, demonstrating effectiveness for conversational alignment without reward model training overhead.
+Not applicable per source document.
 
 ---
 
-### 4. Evaluation Results
+## 4. Benchmark Performance and Ablations
 
-#### 4.1 Base Model Performance
+### Base Model Performance
 
-**English Benchmarks** (DeepSeek 67B vs LLaMA-2 70B):
-- Comparable on language understanding: HellaSwag (84.0 vs 84.0), PIQA (83.6 vs 82.0)
-- Superior on reasoning: BBH (68.7 vs 62.9), MMLU (71.3 vs 69.0)
-- **Significantly better on code/math**:
-  - HumanEval: **42.7% vs 28.7%** (+49% relative improvement)
-  - MBPP: **57.4% vs 45.6%** (+26%)
-  - MATH: **18.7% vs 13.5%** (+39%)
-  - GSM8K: **63.4% vs 58.4%** (+9%)
+| Benchmark | LLaMA2 7B | DeepSeek 7B | LLaMA2 70B | DeepSeek 67B |
+|-----------|-----------|-------------|------------|--------------|
+| MMLU (5-shot) | 45.8 | 48.2 | 69.0 | 71.3 |
+| GSM8K (8-shot) | 15.5 | 17.4 | 58.4 | 63.4 |
+| MATH (4-shot) | 2.5 | 6.0 | 13.5 | 18.7 |
+| HumanEval (0-shot) | 14.6 | 26.2 | 28.7 | 42.7 |
+| MBPP (3-shot) | 21.8 | 39.0 | 45.6 | 57.4 |
+| BBH (3-shot) | 38.5 | 39.5 | 62.9 | 68.7 |
+| C-Eval (5-shot) | 33.9 | 45.0 | 51.4 | 66.1 |
+| CMMLU (5-shot) | 32.6 | 47.2 | 53.1 | 70.8 |
 
-**Chinese Benchmarks**:
-- CHID (idiom understanding): **92.1% vs 55.5%** (requires Chinese training data)
-- C-Eval: **66.1% vs 51.4%**
-- CMMLU: **70.8% vs 53.1%**
+### Chat Model Performance
 
-**Key Insight**: The performance gap between DeepSeek 67B and LLaMA-2 70B exceeds that between respective 7B models, indicating language interference affects smaller models more severely. However, mathematical reasoning transfers across languages (LLaMA-2's CMath performance).
+| Benchmark | DeepSeek 7B Base | DeepSeek 7B Chat | DeepSeek 67B Base | DeepSeek 67B Chat |
+|-----------|------------------|------------------|-------------------|-------------------|
+| GSM8K | 17.4 | 63.0 | 63.4 | 84.1 |
+| MATH | 6.0 | 15.8 | 18.7 | 32.6 |
+| HumanEval | 26.2 | 48.2 | 42.7 | 73.8 |
+| MBPP | 39.0 | 35.2 | 57.4 | 61.4 |
+| BBH | 39.5 | 42.3 | 68.7 | 71.7 |
 
-#### 4.2 Chat Model Performance
+### Open-Ended Evaluation
 
-**AlignBench (Chinese)**: DeepSeek 67B Chat scores 6.43, surpassing ChatGPT (6.08) and ranking third behind GPT-4 variants. DPO version achieves 6.69 with improvements across all categories.
+MT-Bench scores (English):
+- GPT-4-1106-preview: 9.26
+- DeepSeek 67B Chat DPO: 8.76
+- DeepSeek 67B Chat: 8.35
+- GPT-3.5-turbo-0613: 8.39
+- LLaMA-2-Chat 70B: 6.86
 
-**MT-Bench (English)**: DPO version scores 8.76, second only to GPT-4 (9.26) and ahead of GPT-3.5 (8.39).
+AlignBench scores (Chinese):
+- GPT-4-1106-preview: 8.01
+- DeepSeek 67B Chat DPO: 6.69
+- DeepSeek 67B Chat: 6.43
+- GPT-3.5-turbo-0613: 6.08
 
-**Held-Out Evaluations** (demonstrating true generalization):
-- LeetCode Weekly Contests: 17.5% (vs 12.7% for Qwen 72B)
-- Hungarian Math Exam: 58/100 (vs 52 for Qwen 72B)
-- IFEval (instruction following): 55.5% (vs 50.8% for Qwen 72B)
+### Held-Out Dataset Performance
 
-#### 4.3 Safety Evaluation
+| Model | LeetCode | Hungarian Exam | IFEval |
+|-------|----------|----------------|--------|
+| GPT-4 | 48.4 | 68 | 79.3 |
+| DeepSeek 67B Chat | 17.5 | 58 | 55.5 |
+| Yi-Chat 34B | 7.9 | 39 | 48.4 |
+| DeepSeek 7B Chat | 4.7 | 28.5 | 41.2 |
 
-**Internal Safety Test**: 2,400 manually curated questions across 5 major categories
-- Overall safety rate: >95% across all categories
-- Highest: "Other Safety Issues" (767/800 = 95.9%)
-- Lowest: "Trade Secrets & IP" (281/300 = 93.7%)
+### Safety Evaluation
 
-**Do-Not-Answer Benchmark**: Score of **97.8**, exceeding both ChatGPT (97.7) and GPT-4 (96.5)
+Do-Not-Answer safety scores:
+- DeepSeek 67B Chat: 97.8
+- ChatGPT: 97.7
+- GPT-4: 96.5
 
----
+Internal safety taxonomy evaluation: 2400 questions across 5 categories with 2097/2400 safe responses.
 
-### 5. Key Discussion Findings
+### Scaling Law Ablations
 
-#### 5.1 Multi-Choice Question Data
+Optimal hyperparameter scaling with compute budget C:
 
-**Experiment**: Adding 20M Chinese MC questions during fine-tuning
+```
+η_opt = 0.3118 * C^(-0.1250)
+B_opt = 0.2920 * C^(0.3271)
+```
 
-**Results**:
-- MMLU: 49.4% → 60.9% (+11.5 points)
-- C-Eval: 47.0% → 71.3% (+24.3 points)
-- CMMLU: 49.7% → 73.8% (+24.1 points)
-- TriviaQA: 57.9% → 57.9% (no change)
-- ChineseQA: 75.0% → 74.4% (slight decrease)
+Optimal model/data allocation:
 
-**Conclusion**: MC data improves MC benchmark performance but doesn't enhance true intelligence or generative QA capability. **Decision: Exclude MC data to avoid benchmark overfitting.**
+```
+M_opt = 0.1715 * C^(0.5243)
+D_opt = 5.8316 * C^(0.4757)
+```
 
-#### 5.2 System Prompt Effects
+Data quality impact on scaling exponents:
 
-**Observation**: Adding system prompts (modified from LLaMA-2's template) affects models differently:
-- 7B model: MT-Bench 7.15 → 7.11 (-0.04)
-- 67B model: MT-Bench 8.35 → 8.58 (+0.23)
-
-**Interpretation**: Larger models better comprehend and follow system-level instructions, while smaller models may suffer from train-test distribution mismatch.
-
-#### 5.3 Instruction Data in Pre-Training
-
-**Experiment**: Adding 5M instruction instances (primarily MC) in final 10% of pre-training
-
-**Finding**: Base model benchmark improvements equal those from adding the same data during SFT. **Decision: Omit instruction data from pre-training** to preserve pre-training data budget for more general knowledge.
-
----
-
-### 6. Infrastructure and Engineering
-
-**Training Framework**: HAI-LLM with:
-- 4D parallelism: Data, Tensor, Sequence, Pipeline (1F1B schedule)
-- ZeRO-1 optimizer state partitioning
-- FlashAttention for memory efficiency
-- Operator fusion (LayerNorm, GEMM, Adam, in-place cross-entropy)
-- Mixed precision: bf16 computation, fp32 gradient accumulation
-
-**Fault Tolerance**: Asynchronous checkpointing every 5 minutes ensures ≤5 min training loss on hardware failures.
-
-**Evaluation Infrastructure**: vLLM for generative tasks, continuous batching for non-generative tasks.
+| Dataset | Model Scaling (a) | Data Scaling (b) |
+|---------|-------------------|------------------|
+| Early In-house | 0.450 | 0.550 |
+| Current In-house | 0.524 | 0.476 |
+| OpenWebText2 | 0.578 | 0.422 |
+| Chinchilla (MassiveText) | 0.49 | 0.51 |
+| OpenAI (OpenWebText2) | 0.73 | 0.27 |
 
 ---
 
-## Key Takeaways
+## 5. Key Technical Takeaways
 
-1. **Scaling Laws Are Data-Dependent**: The optimal model/data allocation strategy varies significantly with data quality (exponent a ranges from 0.45 to 0.578). Higher quality data justifies larger models.
-
-2. **Hyperparameter Formulae Enable Predictable Scaling**: Power law relationships for batch size and learning rate (B_opt ∝ C^0.33, η_opt ∝ C^-0.125) provide empirical guidance for future scaling.
-
-3. **Non-Embedding FLOPs/Token (M) Is Superior**: Using M instead of parameter count N reduces prediction error by up to 50% for small models, enabling accurate 1000× extrapolation.
-
-4. **Depth Over Width for Large Models**: Prioritizing layers (95 for 67B) over FFN width yields better performance while maintaining parameter count.
-
-5. **Two-Stage SFT Mitigates Repetition**: For smaller models struggling with math/code SFT data, separating capability acquisition (stage 1) from conversational refinement (stage 2) reduces repetition without sacrificing performance.
-
-6. **Benchmark Overfitting Is Real**: Multi-choice data dramatically improves MC benchmarks without enhancing true intelligence. Held-out evaluations reveal the performance gap between model sizes more accurately than standard benchmarks.
-
-7. **Open-Source Parity with Proprietary Models**: Rigorous methodology enables 67B model to match/exceed GPT-3.5 in open-ended evaluations while surpassing LLaMA-2 70B on technical benchmarks.
+- Non-embedding FLOPs/token (M) provides more accurate model scale representation than parameter counts, reducing approximation error from 50% to near-zero for small models
+- Optimal batch size increases and learning rate decreases as power laws of compute budget, with near-optimal parameters occupying broad band ranges
+- Data quality significantly influences optimal model/data scaling allocation; higher quality data necessitates increased model scaling allocation (higher exponent a, lower exponent b)
+- Multi-step learning rate scheduler achieves equivalent performance to cosine scheduler while enabling continual training through phase reuse
+- Small-scale experiments (1e17 FLOPs) accurately predict performance at 1000× compute scale (3e20 FLOPs)
+- Performance advantage of 67B over LLaMA-2 70B exceeds that of 7B over LLaMA-2 7B, indicating greater language conflict impact on smaller models
+- Two-stage SFT mitigates repetition behavior in smaller models without degrading benchmark performance
+- DPO enhances open-ended generation with minimal standard benchmark impact
+- Instruction data in pre-training provides no advantage over equivalent SFT-stage inclusion
+- System prompts benefit large models (67B) but degrade small model (7B) performance
+- Multi-choice question data improves MC benchmark scores but does not transfer to generative evaluation formats
 
 ---
 
-## Conclusion
+## 6. Conclusion
 
-DeepSeek LLM demonstrates that systematic application of refined scaling laws, coupled with high-quality data curation and thoughtful architectural choices, enables open-source models to achieve competitive performance with proprietary systems. The project's "longtermist" philosophy—investing in fundamental research to guide future scaling—contrasts with practices focused solely on fixed-size model optimization.
+DeepSeek LLM establishes refined scaling law methodology through non-embedding FLOPs/token representation and demonstrates data quality dependence in optimal model/data allocation strategies. The 7B and 67B models, trained on 2 trillion bilingual tokens with scaling law guidance, achieve competitive performance against larger models while maintaining open-source accessibility. The 67B Chat variant matches GPT-3.5 on open-ended evaluations and exceeds both GPT-3.5 and GPT-4 on safety benchmarks. Limitations include static knowledge cutoff, hallucination tendencies, incomplete Chinese data coverage in initial version, and limited multilingual capability beyond Chinese-English. Future work includes expanded code intelligence capabilities, Mixture-of-Experts architectures, enhanced reasoning through reinforcement learning, and dataset expansion for improved mathematical and Chinese knowledge coverage.
 
-**Future Directions** (from paper):
-- Upcoming releases: Code intelligence and Mixture-of-Experts (MoE) technical reports
-- Next version improvements: Enhanced reasoning, Chinese knowledge, math, and code capabilities through larger, refined datasets
-- Alignment research: Reinforcement learning to boost complex reasoning
+---
 
-**Limitations**:
-- Knowledge cutoff (January 2025 for this analysis context)
-- Potential hallucination in long-form generation
-- Non-exhaustive Chinese data in v1 may impact certain cultural topics
-- Limited multilingual capability beyond Chinese/English
+## References
 
-The paper's methodological rigor, transparency about design decisions, and comprehensive ablation studies set a high standard for open-source LLM research, providing the community with actionable insights for future model development.
-
-Reference: https://arxiv.org/pdf/2401.02954
+- Paper: arXiv:2401.02954v1 [cs.CL] 5 Jan 2024
+- Authors: 95 contributors from DeepSeek-AI (alphabetically ordered)
+- Training: 2 trillion tokens, bilingual corpus (Chinese/English emphasis), multi-step learning rate scheduler, bf16 precision with fp32 gradient accumulation
+- Evaluation: Internal framework spanning 30+ benchmarks including MMLU, GSM8K, MATH, HumanEval, MBPP, BBH, C-Eval, CMMLU, MT-Bench, AlignBench
+- Architecture references: LLaMA (Touvron et al., 2023a,b), Transformer (Vaswani et al., 2017), GQA (Ainslie et al., 2023), RoPE (Su et al., 2024), SwiGLU (Shazeer, 2020), RMSNorm (Zhang and Sennrich, 2019)
+- Scaling laws: Kaplan et al. (2020), Hoffmann et al. (2022), Henighan et al. (2020)
+- Alignment: SFT methodology (Ouyang et al., 2022), DPO (Rafailov et al., 2023)
+- Infrastructure: HAI-LLM (High-flyer, 2023), Megatron components (Korthikanti et al., 2023; Narayanan et al., 2021; Shoeybi et al., 2019), FlashAttention (Dao, 2023; Dao et al., 2022), ZeRO (Rajbhandari et al., 2020), vLLM (Kwon et al., 2023)
+- Tokenizer: Byte-level BPE via Huggingface tokenizers library (2019), 100,015 vocabulary size extended to 102,400
+- Data sources: Common Crawl deduplication approach informed by RedPajama (Computer, 2023), The Pile (Gao et al., 2020), RefinedWeb (Penedo et al., 2023)
